@@ -8,8 +8,11 @@
   let transcoding = $state<boolean>(false);
   let error = $state<string>("");
   let ffmpeg: FFmpeg;
-  let videoSegments = $state<Array<{ name: string; url: string }>>([]);
+  let videoSegments = $state<
+    Array<{ name: string; url: string; start: number; end: number }>
+  >([]);
   let selectedFile = $state<File | null>(null);
+  let sourceDuration = $state<number>(0);
   let fileInputElement = $state<HTMLInputElement>();
   let dragOver = $state<boolean>(false);
   let messageElement = $state<HTMLParagraphElement>();
@@ -17,6 +20,15 @@
   // New state variables for start time and segment length
   let startTime = $state<string>("00:00:00");
   let segmentLength = $state<number>(3);
+
+  // Cut mode: "custom" keeps the original format, "rounds" enables the
+  // boxing presets (a round of fighting followed by a break).
+  type CutMode = "custom" | "rounds";
+  type RoundPreset = "roundAndPause" | "fightOnly";
+  let cutMode = $state<CutMode>("custom");
+  let roundPreset = $state<RoundPreset>("fightOnly");
+  let roundLength = $state<number>(180);
+  let breakLength = $state<number>(60);
 
   onMount(() => {
     // Initialize FFmpeg instance
@@ -83,6 +95,14 @@
     // Check if it's a video file
     if (file.type.startsWith("video/")) {
       selectedFile = file;
+      sourceDuration = 0;
+      getVideoDuration(file)
+        .then((duration) => {
+          sourceDuration = duration;
+        })
+        .catch(() => {
+          sourceDuration = 0;
+        });
       console.log(
         "Selected video:",
         file.name,
@@ -123,6 +143,192 @@
     return timeRegex.test(time);
   };
 
+  const timeToSeconds = (time: string): number => {
+    return time
+      .split(":")
+      .map((part) => Number(part))
+      .reduce((acc, part) => acc * 60 + part, 0);
+  };
+
+  const getVideoDuration = (file: File): Promise<number> => {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      const url = URL.createObjectURL(file);
+      video.onloadedmetadata = () => {
+        URL.revokeObjectURL(url);
+        resolve(video.duration);
+      };
+      video.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("Could not read video metadata"));
+      };
+      video.src = url;
+    });
+  };
+
+  const formatTimestamp = (totalSeconds: number): string => {
+    const secs = Math.max(0, Math.floor(totalSeconds));
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    const mm = String(m).padStart(2, "0");
+    const ss = String(s).padStart(2, "0");
+    return h > 0 ? `${String(h).padStart(2, "0")}:${mm}:${ss}` : `${mm}:${ss}`;
+  };
+
+  const collectOutputs = async (
+    sourceStart: number,
+    segmentSeconds: number,
+    cycle = 0,
+  ): Promise<void> => {
+    // Clean up previous video segments
+    videoSegments.forEach((segment) => URL.revokeObjectURL(segment.url));
+    videoSegments = [];
+
+    // List all files to see what was created
+    const files = await ffmpeg.listDir("/");
+    console.log("Available files:", files);
+
+    // Find all output files
+    const outputFiles = files
+      .map((file) => file.name)
+      .filter((name) => name.startsWith("output_") && name.endsWith(".mp4"))
+      .sort(); // Sort to maintain order
+
+    console.log("Found output segments:", outputFiles);
+
+    // Timestamps are derived from the cut schedule so they always line up
+    // with the requested segments, regardless of keyframe placement.
+    const endLimit = sourceDuration > 0 ? sourceDuration : Infinity;
+
+    for (let i = 0; i < outputFiles.length; i++) {
+      const fileName = outputFiles[i];
+      try {
+        const data = await ffmpeg.readFile(fileName);
+        const blob = new Blob([data], { type: "video/mp4" });
+        const url = URL.createObjectURL(blob);
+
+        // In cycle mode (fight only) rounds are spaced by round + break.
+        const rawStart =
+          cycle > 0
+            ? sourceStart + i * cycle
+            : sourceStart + i * segmentSeconds;
+
+        videoSegments.push({
+          name: fileName,
+          url: url,
+          start: Math.min(rawStart, endLimit),
+          end: Math.min(rawStart + segmentSeconds, endLimit),
+        });
+      } catch (err) {
+        console.warn(`Failed to read ${fileName}:`, err);
+      }
+    }
+  };
+
+  const clearPreviousFiles = async (): Promise<void> => {
+    // ffmpeg.wasm keeps its in-memory filesystem between runs, so stale
+    // outputs from a previous, longer run would otherwise be listed again.
+    const files = await ffmpeg.listDir("/");
+    for (const file of files) {
+      if (
+        !file.isDir &&
+        (file.name.startsWith("output_") || file.name.startsWith("input."))
+      ) {
+        try {
+          await ffmpeg.deleteFile(file.name);
+        } catch (err) {
+          console.warn(`Failed to delete ${file.name}:`, err);
+        }
+      }
+    }
+  };
+
+  const writeInputFile = async (): Promise<string> => {
+    // Use the selected file instead of downloading from URL
+    console.log("Processing selected file:", selectedFile!.name);
+
+    // Convert File to Uint8Array
+    const arrayBuffer = await selectedFile!.arrayBuffer();
+    const videoData = new Uint8Array(arrayBuffer);
+
+    // Get file extension from the selected file
+    const fileExtension =
+      selectedFile!.name.split(".").pop()?.toLowerCase() || "mp4";
+    const inputFileName = `input.${fileExtension}`;
+    console.log("Writing input file: " + inputFileName);
+    await ffmpeg.writeFile(inputFileName, videoData);
+
+    return inputFileName;
+  };
+
+  // Original behaviour: split the video into fixed-length segments.
+  const transcodeSegments = async (segmentSeconds: number): Promise<void> => {
+    const inputFileName = await writeInputFile();
+
+    console.log("Starting FFmpeg processing...");
+
+    // Build FFmpeg command with start time and custom segment length
+    const ffmpegArgs = [
+      "-i",
+      inputFileName,
+      "-ss", // Start time option
+      startTime,
+      "-f",
+      "segment",
+      "-segment_time",
+      segmentSeconds.toString(), // Use custom segment length
+      "-c",
+      "copy", // Copy streams without re-encoding for faster processing
+      "-reset_timestamps",
+      "1",
+      "-map",
+      "0",
+      "output_%03d.mp4",
+    ];
+
+    console.log("FFmpeg command:", ffmpegArgs.join(" "));
+    await ffmpeg.exec(ffmpegArgs);
+    await collectOutputs(timeToSeconds(startTime), segmentSeconds);
+  };
+
+  // Boxing preset: cut only the fighting rounds and drop the breaks in between.
+  const transcodeFightOnly = async (): Promise<void> => {
+    const inputFileName = await writeInputFile();
+
+    const startSeconds = timeToSeconds(startTime);
+    const cycle = roundLength + breakLength;
+    const duration = await getVideoDuration(selectedFile!);
+    const roundCount = Math.max(0, Math.ceil((duration - startSeconds) / cycle));
+
+    console.log(
+      `Fight-only mode: ${roundCount} round(s) of ${roundLength}s, skipping ${breakLength}s between rounds`,
+    );
+
+    // Each round starts at start + i * (round + break) and is cut for roundLength.
+    for (let i = 0; i < roundCount; i++) {
+      const offset = startSeconds + i * cycle;
+      const outputName = `output_${String(i).padStart(3, "0")}.mp4`;
+      const ffmpegArgs = [
+        "-ss",
+        offset.toString(),
+        "-i",
+        inputFileName,
+        "-t",
+        roundLength.toString(),
+        "-c",
+        "copy",
+        outputName,
+      ];
+
+      console.log("FFmpeg command:", ffmpegArgs.join(" "));
+      await ffmpeg.exec(ffmpegArgs);
+    }
+
+    await collectOutputs(startSeconds, roundLength, cycle);
+  };
+
   const transcode = async (): Promise<void> => {
     if (!loaded) {
       error = "FFmpeg not loaded yet";
@@ -136,7 +342,19 @@
       error = "Invalid start time format. Use HH:MM:SS, MM:SS, or SS format";
       return;
     }
-    if (segmentLength <= 0) {
+
+    const roundsMode = cutMode === "rounds";
+    const segmentSeconds = roundsMode
+      ? roundLength + breakLength
+      : segmentLength;
+
+    if (roundsMode) {
+      if (roundLength <= 0 || breakLength < 0) {
+        error =
+          "Round length must be greater than 0 and break length cannot be negative";
+        return;
+      }
+    } else if (segmentLength <= 0) {
       error = "Segment length must be greater than 0";
       return;
     }
@@ -147,82 +365,17 @@
 
       console.log("Starting transcoding...");
       console.log(
-        `Start time: ${startTime}, Segment length: ${segmentLength}s`,
+        `Start time: ${startTime}, Mode: ${
+          roundsMode ? `rounds (${roundPreset})` : "custom"
+        }, Segment length: ${segmentSeconds}s`,
       );
 
-      // Use the selected file instead of downloading from URL
-      console.log("Processing selected file:", selectedFile.name);
+      await clearPreviousFiles();
 
-      // Convert File to Uint8Array
-      const arrayBuffer = await selectedFile.arrayBuffer();
-      const videoData = new Uint8Array(arrayBuffer);
-
-      console.log(selectedFile);
-      // Get file extension from the selected file
-      const fileExtension =
-        selectedFile.name.split(".").pop()?.toLowerCase() || "mp4";
-      const inputFileName = `input.${fileExtension}`;
-      console.log("Input file: " + inputFileName);
-
-      console.log("Writing input file...");
-      await ffmpeg.writeFile(inputFileName, videoData);
-
-      console.log("Starting FFmpeg processing...");
-
-      // Build FFmpeg command with start time and custom segment length
-      const ffmpegArgs = [
-        "-i",
-        inputFileName,
-        "-ss", // Start time option
-        startTime,
-        "-f",
-        "segment",
-        "-segment_time",
-        segmentLength.toString(), // Use custom segment length
-        "-c",
-        "copy", // Copy streams without re-encoding for faster processing
-        "-reset_timestamps",
-        "1",
-        "-map",
-        "0",
-        "output_%03d.mp4",
-      ];
-
-      console.log("FFmpeg command:", ffmpegArgs.join(" "));
-      await ffmpeg.exec(ffmpegArgs);
-
-      console.log("Reading output files...");
-
-      // Clean up previous video segments
-      videoSegments.forEach((segment) => URL.revokeObjectURL(segment.url));
-      videoSegments = [];
-
-      // List all files to see what was created
-      const files = await ffmpeg.listDir("/");
-      console.log("Available files:", files);
-
-      // Find all output files
-      const outputFiles = files
-        .map((file) => file.name)
-        .filter((name) => name.startsWith("output_") && name.endsWith(".mp4"))
-        .sort(); // Sort to maintain order
-
-      console.log("Found output segments:", outputFiles);
-
-      // Read all segments and create URLs
-      for (const fileName of outputFiles) {
-        try {
-          const data = await ffmpeg.readFile(fileName);
-          const blob = new Blob([data], { type: "video/mp4" });
-          const url = URL.createObjectURL(blob);
-
-          videoSegments.push({
-            name: fileName,
-            url: url,
-          });
-        } catch (err) {
-          console.warn(`Failed to read ${fileName}:`, err);
-        }
+      if (roundsMode && roundPreset === "fightOnly") {
+        await transcodeFightOnly();
+      } else {
+        await transcodeSegments(segmentSeconds);
       }
 
       console.log(`Successfully loaded ${videoSegments.length} video segments`);
@@ -269,6 +422,9 @@
           <strong>Selected:</strong>
           {selectedFile.name}
           ({(selectedFile.size / 1024 / 1024).toFixed(2)} MB)
+          {#if sourceDuration > 0}
+            | <strong>Length:</strong> {formatTimestamp(sourceDuration)}
+          {/if}
         </p>
       {/if}
     </div>
@@ -291,29 +447,109 @@
       </div>
 
       <div class="input-group">
-        <label for="segmentLength">Segment Length (seconds):</label>
-        <input
-          id="segmentLength"
-          bind:value={segmentLength}
-          type="number"
-          min="1"
-          step="0.1"
-          class="number-input"
-        />
-        <small>Length of each video segment in seconds</small>
+        <span class="group-label">Cut Mode:</span>
+        <label class="radio-label">
+          <input type="radio" bind:group={cutMode} value="custom" />
+          Custom segment length
+        </label>
+        <label class="radio-label">
+          <input type="radio" bind:group={cutMode} value="rounds" />
+          Boxing rounds preset
+        </label>
       </div>
+
+      {#if cutMode === "custom"}
+        <div class="input-group">
+          <label for="segmentLength">Segment Length (seconds):</label>
+          <input
+            id="segmentLength"
+            bind:value={segmentLength}
+            type="number"
+            min="1"
+            step="0.1"
+            class="number-input"
+          />
+          <small>Length of each video segment in seconds</small>
+        </div>
+      {:else}
+        <div class="input-group">
+          <span class="group-label">Round Preset:</span>
+          <label class="radio-label">
+            <input type="radio" bind:group={roundPreset} value="roundAndPause" />
+            Round + pause (one {roundLength + breakLength}s clip)
+          </label>
+          <label class="radio-label">
+            <input type="radio" bind:group={roundPreset} value="fightOnly" />
+            Fights only (cut {roundLength}s, skip {breakLength}s)
+          </label>
+        </div>
+
+        <div class="input-group">
+          <label for="roundLength">Round Length (seconds):</label>
+          <input
+            id="roundLength"
+            bind:value={roundLength}
+            type="number"
+            min="1"
+            step="1"
+            class="number-input"
+          />
+        </div>
+
+        <div class="input-group">
+          <label for="breakLength">Break Length (seconds):</label>
+          <input
+            id="breakLength"
+            bind:value={breakLength}
+            type="number"
+            min="0"
+            step="1"
+            class="number-input"
+          />
+          <small>Pause between rounds (skipped in "Fights only" mode)</small>
+        </div>
+      {/if}
+
+      <button
+        class="transcode-button"
+        onclick={transcode}
+        disabled={transcoding || !selectedFile}
+      >
+        {transcoding
+          ? "Processing..."
+          : selectedFile
+            ? cutMode === "rounds"
+              ? roundPreset === "fightOnly"
+                ? `Cut ${roundLength}s fights, skip ${breakLength}s breaks from ${startTime}`
+                : `Split into ${roundLength + breakLength}s round + pause clips from ${startTime}`
+              : `Split video into ${segmentLength}s segments starting at ${startTime}`
+            : "Select a video file first"}
+      </button>
     </div>
 
     {#if videoSegments.length > 0}
       <div class="video-grid">
         <h3>Video Segments ({videoSegments.length} total)</h3>
         <p class="segment-info">
-          Started at: <strong>{startTime}</strong> | Segment length:
-          <strong>{segmentLength}s</strong>
+          Started at: <strong>{startTime}</strong> |
+          {#if cutMode === "rounds"}
+            {roundPreset === "fightOnly"
+              ? `Rounds only: ${roundLength}s cut / ${breakLength}s skipped`
+              : `Round + pause: ${roundLength + breakLength}s per clip`}
+          {:else}
+            Segment length: <strong>{segmentLength}s</strong>
+          {/if}
         </p>
         {#each videoSegments as segment, index}
           <div class="video-segment">
             <h4>Segment {index + 1}: {segment.name}</h4>
+            <p class="segment-time">
+              <strong>{formatTimestamp(segment.start)}</strong>
+              → <strong>{formatTimestamp(segment.end)}</strong>
+              <span class="segment-duration"
+                >({formatTimestamp(segment.end - segment.start)})</span
+              >
+            </p>
             <video
               src={segment.url}
               controls
@@ -331,14 +567,6 @@
       </p>
     {/if}
 
-    <br />
-    <button onclick={transcode} disabled={transcoding || !selectedFile}>
-      {transcoding
-        ? "Processing..."
-        : selectedFile
-          ? `Split video into ${segmentLength}s segments starting at ${startTime}`
-          : "Select a video file first"}
-    </button>
     <p bind:this={messageElement}></p>
     <p><em>Open Developer Tools (Ctrl+Shift+I) to view detailed logs</em></p>
   {:else}
@@ -426,6 +654,11 @@
     background: #f8f9fa;
   }
 
+  .transcode-button {
+    width: 100%;
+    margin: 10px 0 0 0;
+  }
+
   .controls-section h3 {
     margin: 0 0 15px 0;
     color: #333;
@@ -440,6 +673,27 @@
     margin-bottom: 5px;
     font-weight: bold;
     color: #555;
+  }
+
+  .input-group .group-label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: bold;
+    color: #555;
+  }
+
+  .radio-label {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-weight: normal !important;
+    cursor: pointer;
+  }
+
+  .radio-label input[type="radio"] {
+    width: auto;
+    margin: 0;
   }
 
   .time-input,
@@ -490,5 +744,15 @@
     margin: 0 0 10px 0;
     color: #333;
     font-size: 14px;
+  }
+
+  .segment-time {
+    margin: 0 0 10px 0;
+    font-size: 13px;
+    color: #2c5282;
+  }
+
+  .segment-duration {
+    color: #666;
   }
 </style>
