@@ -592,8 +592,9 @@
   }
 
   .error {
-    background: #fee;
-    border: 1px solid #fcc;
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--text);
     padding: 10px;
     margin: 10px 0;
     border-radius: 4px;
@@ -603,27 +604,28 @@
     padding: 10px 20px;
     margin: 5px;
     border: none;
-    background: #007cba;
-    color: white;
+    background: var(--accent);
+    color: #ffffff;
     border-radius: 4px;
     cursor: pointer;
   }
 
   button:disabled {
-    background: #ccc;
+    background: var(--disabled);
     cursor: not-allowed;
   }
 
   button:hover:not(:disabled) {
-    background: #005a87;
+    background: var(--accent-hover);
   }
 
   .file-input-section {
     margin: 20px 0;
     padding: 20px;
-    border: 2px dashed #ddd;
+    border: 2px dashed var(--border);
     border-radius: 8px;
-    background: #fafafa;
+    background: var(--surface-dashed);
+    color: var(--text);
     text-align: center;
     cursor: pointer;
     transition: all 0.3s ease;
@@ -631,17 +633,33 @@
 
   .file-input-section:hover,
   .file-input-section.drag-over {
-    border-color: #007cba;
-    background: #f0f8ff;
+    border-color: var(--accent);
+    background: var(--drag-bg);
   }
 
   .file-input {
     margin: 10px 0;
     padding: 5px;
+    color: var(--text);
+  }
+
+  .file-input::file-selector-button {
+    margin-right: 10px;
+    padding: 8px 14px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: #ffffff;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .file-input::file-selector-button:hover {
+    background: var(--accent-hover);
   }
 
   .file-info {
-    color: #666;
+    color: var(--text-muted);
     font-size: 14px;
     margin: 10px 0;
   }
@@ -649,9 +667,10 @@
   .controls-section {
     margin: 20px 0;
     padding: 20px;
-    border: 1px solid #ddd;
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: #f8f9fa;
+    background: var(--surface-alt);
+    color: var(--text);
   }
 
   .transcode-button {
@@ -661,7 +680,7 @@
 
   .controls-section h3 {
     margin: 0 0 15px 0;
-    color: #333;
+    color: var(--text-strong);
   }
 
   .input-group {
@@ -672,14 +691,14 @@
     display: block;
     margin-bottom: 5px;
     font-weight: bold;
-    color: #555;
+    color: var(--text);
   }
 
   .input-group .group-label {
     display: block;
     margin-bottom: 8px;
     font-weight: bold;
-    color: #555;
+    color: var(--text);
   }
 
   .radio-label {
@@ -694,13 +713,16 @@
   .radio-label input[type="radio"] {
     width: auto;
     margin: 0;
+    accent-color: var(--accent);
   }
 
   .time-input,
   .number-input {
     width: 200px;
     padding: 8px 12px;
-    border: 1px solid #ddd;
+    background: var(--field-bg);
+    color: var(--field-text);
+    border: 1px solid var(--border);
     border-radius: 4px;
     font-size: 14px;
   }
@@ -708,14 +730,14 @@
   .time-input:focus,
   .number-input:focus {
     outline: none;
-    border-color: #007cba;
-    box-shadow: 0 0 0 2px rgba(0, 124, 186, 0.1);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
   }
 
   .input-group small {
     display: block;
     margin-top: 5px;
-    color: #666;
+    color: var(--text-muted);
     font-size: 12px;
   }
 
@@ -724,35 +746,36 @@
   }
 
   .segment-info {
-    background: #e9f5ff;
+    background: var(--info-bg);
     padding: 10px;
     border-radius: 4px;
     margin: 10px 0;
     font-size: 14px;
-    color: #2c5282;
+    color: var(--info-text);
   }
 
   .video-segment {
     margin: 15px 0;
     padding: 15px;
-    border: 1px solid #ddd;
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: #f9f9f9;
+    background: var(--surface-alt);
+    color: var(--text);
   }
 
   .video-segment h4 {
     margin: 0 0 10px 0;
-    color: #333;
+    color: var(--text-strong);
     font-size: 14px;
   }
 
   .segment-time {
     margin: 0 0 10px 0;
     font-size: 13px;
-    color: #2c5282;
+    color: var(--info-text);
   }
 
   .segment-duration {
-    color: #666;
+    color: var(--text-muted);
   }
 </style>
