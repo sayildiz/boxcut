@@ -2,6 +2,14 @@
   import { onMount, onDestroy } from "svelte";
   import { FFmpeg } from "@ffmpeg/ffmpeg";
   import { fetchFile, toBlobURL } from "@ffmpeg/util";
+  import {
+    DEFAULT_DETECT_CONFIG,
+    detectBoundaries,
+    onsetsToRounds,
+    toInt16Array,
+    type Segment,
+  } from "./audioDetection";
+  import { detectGong, YAMNET_SAMPLE_RATE } from "./yamnet";
 
   let loaded = $state<boolean>(false);
   let loading = $state<boolean>(false);
@@ -15,20 +23,35 @@
   let sourceDuration = $state<number>(0);
   let fileInputElement = $state<HTMLInputElement>();
   let dragOver = $state<boolean>(false);
-  let messageElement = $state<HTMLParagraphElement>();
 
   // New state variables for start time and segment length
   let startTime = $state<string>("00:00:00");
   let segmentLength = $state<number>(3);
 
   // Cut mode: "custom" keeps the original format, "rounds" enables the
-  // boxing presets (a round of fighting followed by a break).
-  type CutMode = "custom" | "rounds";
+  // boxing presets (a round of fighting followed by a break), and "auto"
+  // detects bell onsets from the audio and cuts the resulting intervals.
+  type CutMode = "custom" | "rounds" | "auto";
   type RoundPreset = "roundAndPause" | "fightOnly";
   let cutMode = $state<CutMode>("custom");
   let roundPreset = $state<RoundPreset>("fightOnly");
   let roundLength = $state<number>(180);
   let breakLength = $state<number>(60);
+
+  // Audio-detection state.
+  type DetectedClip = Segment & { isBreak: boolean; enabled: boolean };
+  type DetectBackend = "model" | "energy";
+  let detecting = $state<boolean>(false);
+  let detectStatus = $state<string>("");
+  let detectBackend = $state<DetectBackend>("model");
+  let onsets = $state<number[]>([]);
+  let detectedClips = $state<DetectedClip[]>([]);
+  let breakPatternFound = $state<boolean>(false);
+  let includeBreaks = $state<boolean>(false);
+  let detectSensitivity = $state<number>(DEFAULT_DETECT_CONFIG.sensitivityDb);
+  let detectThreshold = $state<number>(0.3);
+  let detectMinGap = $state<number>(DEFAULT_DETECT_CONFIG.minGapSec);
+  let detectBreakLength = $state<number>(60);
 
   onMount(() => {
     // Initialize FFmpeg instance
@@ -50,9 +73,6 @@
         "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
 
       ffmpeg.on("log", ({ message }: { message: string }) => {
-        if (messageElement) {
-          messageElement.textContent = message;
-        }
         console.log(message);
       });
 
@@ -177,10 +197,11 @@
     return h > 0 ? `${String(h).padStart(2, "0")}:${mm}:${ss}` : `${mm}:${ss}`;
   };
 
+  // `segmentAt` derives display timestamps from the cut schedule (or from the
+  // detected intervals), so they line up with the requested clips regardless
+  // of keyframe placement.
   const collectOutputs = async (
-    sourceStart: number,
-    segmentSeconds: number,
-    cycle = 0,
+    segmentAt: (index: number) => Segment,
   ): Promise<void> => {
     // Clean up previous video segments
     videoSegments.forEach((segment) => URL.revokeObjectURL(segment.url));
@@ -198,8 +219,6 @@
 
     console.log("Found output segments:", outputFiles);
 
-    // Timestamps are derived from the cut schedule so they always line up
-    // with the requested segments, regardless of keyframe placement.
     const endLimit = sourceDuration > 0 ? sourceDuration : Infinity;
 
     for (let i = 0; i < outputFiles.length; i++) {
@@ -208,18 +227,13 @@
         const data = await ffmpeg.readFile(fileName);
         const blob = new Blob([data], { type: "video/mp4" });
         const url = URL.createObjectURL(blob);
-
-        // In cycle mode (fight only) rounds are spaced by round + break.
-        const rawStart =
-          cycle > 0
-            ? sourceStart + i * cycle
-            : sourceStart + i * segmentSeconds;
+        const segment = segmentAt(i);
 
         videoSegments.push({
           name: fileName,
           url: url,
-          start: Math.min(rawStart, endLimit),
-          end: Math.min(rawStart + segmentSeconds, endLimit),
+          start: Math.min(segment.start, endLimit),
+          end: Math.min(segment.end, endLimit),
         });
       } catch (err) {
         console.warn(`Failed to read ${fileName}:`, err);
@@ -234,7 +248,9 @@
     for (const file of files) {
       if (
         !file.isDir &&
-        (file.name.startsWith("output_") || file.name.startsWith("input."))
+        (file.name.startsWith("output_") ||
+          file.name.startsWith("input.") ||
+          file.name === "audio.pcm")
       ) {
         try {
           await ffmpeg.deleteFile(file.name);
@@ -290,7 +306,11 @@
 
     console.log("FFmpeg command:", ffmpegArgs.join(" "));
     await ffmpeg.exec(ffmpegArgs);
-    await collectOutputs(timeToSeconds(startTime), segmentSeconds);
+    const start = timeToSeconds(startTime);
+    await collectOutputs((i) => ({
+      start: start + i * segmentSeconds,
+      end: start + (i + 1) * segmentSeconds,
+    }));
   };
 
   // Boxing preset: cut only the fighting rounds and drop the breaks in between.
@@ -326,7 +346,192 @@
       await ffmpeg.exec(ffmpegArgs);
     }
 
-    await collectOutputs(startSeconds, roundLength, cycle);
+    await collectOutputs((i) => ({
+      start: startSeconds + i * cycle,
+      end: startSeconds + i * cycle + roundLength,
+    }));
+  };
+
+  const applyBreakInclusion = (): void => {
+    for (const clip of detectedClips) {
+      clip.enabled = includeBreaks || !clip.isBreak;
+    }
+  };
+
+  // Decode the video's audio to mono PCM, scan for bell onsets, and turn them
+  // into candidate fight/break clips for the user to review before cutting.
+  const runDetection = async (): Promise<void> => {
+    if (!loaded || !selectedFile) {
+      error = "Load FFmpeg and select a video first";
+      return;
+    }
+    if (!validateTimeFormat(startTime)) {
+      error = "Invalid start time format. Use HH:MM:SS, MM:SS, or SS format";
+      return;
+    }
+    if (
+      detectBreakLength <= 0 ||
+      detectMinGap <= 0 ||
+      (detectBackend === "energy" && detectSensitivity <= 0) ||
+      (detectBackend === "model" && (detectThreshold <= 0 || detectThreshold >= 1))
+    ) {
+      error = "Detection settings must be valid numbers";
+      return;
+    }
+
+    detecting = true;
+    error = "";
+    detectStatus =
+      detectBackend === "model" ? "Loading model…" : "Analyzing audio…";
+    onsets = [];
+    detectedClips = [];
+    breakPatternFound = false;
+    try {
+      console.log("Extracting audio for detection...");
+      await clearPreviousFiles();
+      const inputFileName = await writeInputFile();
+      const sampleRate =
+        detectBackend === "model"
+          ? YAMNET_SAMPLE_RATE
+          : DEFAULT_DETECT_CONFIG.sampleRate;
+      await ffmpeg.exec([
+        "-i",
+        inputFileName,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        sampleRate.toString(),
+        "-f",
+        "s16le",
+        "audio.pcm",
+      ]);
+      const pcmData = await ffmpeg.readFile("audio.pcm");
+      if (typeof pcmData === "string") {
+        throw new Error("Unexpected text data returned for audio.pcm");
+      }
+      const pcm = toInt16Array(pcmData);
+      console.log(`Analyzing ${pcm.length} audio samples @ ${sampleRate} Hz...`);
+
+      const start = timeToSeconds(startTime);
+      if (detectBackend === "model") {
+        detectStatus = "Running gong classifier…";
+        const result = await detectGong(pcm, {
+          threshold: detectThreshold,
+          minGapSec: detectMinGap,
+          onProgress: (done, total) => {
+            detectStatus = `Analyzing audio ${done}/${total}…`;
+          },
+        });
+        console.log("Top classes per frame:", result.topClassNames);
+        onsets = result.onsets.filter((t) => t >= start);
+      } else {
+        detectStatus = "Scanning for loudness peaks…";
+        const config = {
+          ...DEFAULT_DETECT_CONFIG,
+          sensitivityDb: detectSensitivity,
+          minGapSec: detectMinGap,
+        };
+        onsets = detectBoundaries(pcm, config).filter((t) => t >= start);
+      }
+
+      const mapped = onsetsToRounds(onsets, detectBreakLength);
+      breakPatternFound = mapped.breakPatternFound;
+      detectedClips = mapped.intervals.map((interval) => ({
+        ...interval,
+        enabled: !interval.isBreak,
+      }));
+      console.log("Detected onsets:", onsets);
+      console.log("Detected clips:", detectedClips);
+      if (onsets.length === 0) {
+        error =
+          detectBackend === "model"
+            ? "No gong/bell detected. Try lowering the threshold, or switch to the loudness backend."
+            : "No bell onsets detected. Try lowering the sensitivity, or check that the audio has a clear bell.";
+      }
+    } catch (err) {
+      error = `Audio detection failed: ${err instanceof Error ? err.message : String(err)}`;
+      console.error(error);
+    } finally {
+      detecting = false;
+    }
+  };
+
+  // Cut the intervals the user approved in the detection results.
+  const transcodeDetected = async (): Promise<void> => {
+    const clips = detectedClips.filter(
+      (clip) => clip.enabled && clip.end - clip.start > 0,
+    );
+    if (clips.length === 0) {
+      throw new Error("No valid detected clips to cut");
+    }
+    const inputFileName = await writeInputFile();
+    console.log(`Cutting ${clips.length} audio-detected clip(s)...`);
+
+    const fileExists = async (name: string): Promise<boolean> => {
+      const files = await ffmpeg.listDir("/");
+      return files.some((f) => !f.isDir && f.name === name);
+    };
+
+    const written: Segment[] = [];
+    for (const clip of clips) {
+      const duration = clip.end - clip.start;
+      const outputName = `output_${String(written.length).padStart(3, "0")}.mp4`;
+      const baseArgs = [
+        "-ss",
+        clip.start.toString(),
+        "-i",
+        inputFileName,
+        "-t",
+        duration.toString(),
+      ];
+
+      // Fast path: stream copy. Some codecs/containers cannot be copied into
+      // mp4 or land on a keyframe edge and yield no file, so fall back to a
+      // quick re-encode for this clip.
+      try {
+        const copyCode = await ffmpeg.exec([
+          ...baseArgs,
+          "-c",
+          "copy",
+          outputName,
+        ]);
+        if (copyCode === 0 && (await fileExists(outputName))) {
+          written.push({ start: clip.start, end: clip.end });
+          continue;
+        }
+      } catch (err) {
+        console.warn("Stream-copy cut failed, re-encoding:", err);
+      }
+
+      console.warn(`Re-encoding ${outputName} (stream copy produced nothing)`);
+      try {
+        const encodeCode = await ffmpeg.exec([
+          ...baseArgs,
+          "-c:v",
+          "libx264",
+          "-preset",
+          "ultrafast",
+          "-c:a",
+          "aac",
+          outputName,
+        ]);
+        if (encodeCode === 0 && (await fileExists(outputName))) {
+          written.push({ start: clip.start, end: clip.end });
+        } else {
+          console.warn(`Failed to produce ${outputName} (code ${encodeCode})`);
+        }
+      } catch (err) {
+        console.warn(`Re-encode failed for ${outputName}:`, err);
+      }
+    }
+
+    if (written.length === 0) {
+      throw new Error(
+        "FFmpeg produced no clips for the detected intervals (codec may be unsupported)",
+      );
+    }
+    await collectOutputs((i) => written[i]);
   };
 
   const transcode = async (): Promise<void> => {
@@ -344,11 +549,17 @@
     }
 
     const roundsMode = cutMode === "rounds";
+    const autoMode = cutMode === "auto";
     const segmentSeconds = roundsMode
       ? roundLength + breakLength
       : segmentLength;
 
-    if (roundsMode) {
+    if (autoMode) {
+      if (detectedClips.filter((clip) => clip.enabled).length === 0) {
+        error = "Detect rounds and select at least one clip first";
+        return;
+      }
+    } else if (roundsMode) {
       if (roundLength <= 0 || breakLength < 0) {
         error =
           "Round length must be greater than 0 and break length cannot be negative";
@@ -366,13 +577,15 @@
       console.log("Starting transcoding...");
       console.log(
         `Start time: ${startTime}, Mode: ${
-          roundsMode ? `rounds (${roundPreset})` : "custom"
+          autoMode ? "auto (audio)" : roundsMode ? `rounds (${roundPreset})` : "custom"
         }, Segment length: ${segmentSeconds}s`,
       );
 
       await clearPreviousFiles();
 
-      if (roundsMode && roundPreset === "fightOnly") {
+      if (autoMode) {
+        await transcodeDetected();
+      } else if (roundsMode && roundPreset === "fightOnly") {
         await transcodeFightOnly();
       } else {
         await transcodeSegments(segmentSeconds);
@@ -456,6 +669,10 @@
           <input type="radio" bind:group={cutMode} value="rounds" />
           Boxing rounds preset
         </label>
+        <label class="radio-label">
+          <input type="radio" bind:group={cutMode} value="auto" />
+          Auto-detect rounds from audio (beta)
+        </label>
       </div>
 
       {#if cutMode === "custom"}
@@ -471,7 +688,7 @@
           />
           <small>Length of each video segment in seconds</small>
         </div>
-      {:else}
+      {:else if cutMode === "rounds"}
         <div class="input-group">
           <span class="group-label">Round Preset:</span>
           <label class="radio-label">
@@ -508,21 +725,166 @@
           />
           <small>Pause between rounds (skipped in "Fights only" mode)</small>
         </div>
+      {:else}
+        <div class="input-group">
+          <span class="group-label">Detection method:</span>
+          <label class="radio-label">
+            <input type="radio" bind:group={detectBackend} value="model" />
+            Gong classifier (YAMNet)
+          </label>
+          <label class="radio-label">
+            <input type="radio" bind:group={detectBackend} value="energy" />
+            Loudness peaks
+          </label>
+        </div>
+
+        {#if detectBackend === "model"}
+          <div class="input-group">
+            <label for="detectThreshold">Confidence threshold:</label>
+            <input
+              id="detectThreshold"
+              bind:value={detectThreshold}
+              type="number"
+              min="0.05"
+              max="0.95"
+              step="0.05"
+              class="number-input"
+            />
+            <small
+              >Lower = more sensitive. First detection downloads the YAMNet model
+              (~16 MB) + WASM runtime (~15 MB).</small
+            >
+          </div>
+        {:else}
+          <div class="input-group">
+            <label for="detectSensitivity">Sensitivity (dB above noise):</label>
+            <input
+              id="detectSensitivity"
+              bind:value={detectSensitivity}
+              type="number"
+              min="2"
+              max="30"
+              step="1"
+              class="number-input"
+            />
+            <small>Lower = more sensitive (but more false positives)</small>
+          </div>
+        {/if}
+
+        <div class="input-group">
+          <label for="detectMinGap">Minimum gap between bells (seconds):</label>
+          <input
+            id="detectMinGap"
+            bind:value={detectMinGap}
+            type="number"
+            min="0.5"
+            max="30"
+            step="0.5"
+            class="number-input"
+          />
+        </div>
+
+        <div class="input-group">
+          <label for="detectBreakLength">Expected break length (seconds):</label>
+          <input
+            id="detectBreakLength"
+            bind:value={detectBreakLength}
+            type="number"
+            min="5"
+            step="1"
+            class="number-input"
+          />
+          <small>Used to tell the round-end/start bell pair apart from round boundaries</small>
+        </div>
+
+        <button
+          class="detect-button"
+          onclick={runDetection}
+          disabled={detecting || transcoding || !selectedFile}
+        >
+          {detecting ? detectStatus || "Analyzing audio..." : "Detect rounds from audio"}
+        </button>
+        <small>Scans the audio for bell/gong onsets. Runs locally in your browser.</small>
+
+        {#if onsets.length > 0}
+          <div class="detect-results">
+            <p>
+              <strong>{onsets.length}</strong> onset{onsets.length === 1
+                ? ""
+                : "s"} detected,
+              <strong>{detectedClips.length}</strong> candidate clip{detectedClips.length ===
+              1
+                ? ""
+                : "s"}.
+              {#if !breakPatternFound && detectedClips.length > 0}
+                <em>No clear break pattern found — review the clips below.</em>
+              {/if}
+            </p>
+            {#if detectedClips.length === 0}
+              <p class="detect-warning">
+                Only one onset was found, so there is nothing to cut between. Lower
+                the confidence threshold (or sensitivity), or set a start time
+                closer to the rounds.
+              </p>
+            {:else}
+              <label class="radio-label">
+                <input
+                  type="checkbox"
+                  bind:checked={includeBreaks}
+                  onchange={applyBreakInclusion}
+                />
+                Include breaks in output (round + pause)
+              </label>
+              <ul class="round-list">
+                {#each detectedClips as clip, index}
+                  <li>
+                    <label class="radio-label">
+                      <input type="checkbox" bind:checked={clip.enabled} />
+                      <span
+                        >{index + 1}: {formatTimestamp(clip.start)} → {formatTimestamp(
+                          clip.end,
+                        )} ({formatTimestamp(clip.end - clip.start)}){clip.isBreak
+                          ? " — break"
+                          : ""}</span
+                      >
+                    </label>
+                  </li>
+                {/each}
+              </ul>
+              <p class="detect-hint">
+                Review the clips above, then click the <strong>Cut</strong> button
+                below.
+              </p>
+            {/if}
+          </div>
+        {:else if !detecting}
+          <p>Load FFmpeg, select a video, then click "Detect rounds from audio".</p>
+        {/if}
       {/if}
 
       <button
         class="transcode-button"
         onclick={transcode}
-        disabled={transcoding || !selectedFile}
+        disabled={transcoding ||
+          detecting ||
+          !selectedFile ||
+          (cutMode === "auto" &&
+            detectedClips.filter((clip) => clip.enabled).length === 0)}
       >
         {transcoding
           ? "Processing..."
           : selectedFile
-            ? cutMode === "rounds"
-              ? roundPreset === "fightOnly"
-                ? `Cut ${roundLength}s fights, skip ${breakLength}s breaks from ${startTime}`
-                : `Split into ${roundLength + breakLength}s round + pause clips from ${startTime}`
-              : `Split video into ${segmentLength}s segments starting at ${startTime}`
+            ? cutMode === "auto"
+              ? detectedClips.filter((clip) => clip.enabled).length > 0
+                ? `Cut ${detectedClips.filter((clip) => clip.enabled).length} detected clips`
+                : detectedClips.length > 0
+                  ? "Select at least one clip"
+                  : "Detect rounds first"
+              : cutMode === "rounds"
+                ? roundPreset === "fightOnly"
+                  ? `Cut ${roundLength}s fights, skip ${breakLength}s breaks from ${startTime}`
+                  : `Split into ${roundLength + breakLength}s round + pause clips from ${startTime}`
+                : `Split video into ${segmentLength}s segments starting at ${startTime}`
             : "Select a video file first"}
       </button>
     </div>
@@ -532,7 +894,9 @@
         <h3>Video Segments ({videoSegments.length} total)</h3>
         <p class="segment-info">
           Started at: <strong>{startTime}</strong> |
-          {#if cutMode === "rounds"}
+          {#if cutMode === "auto"}
+            Audio-detected intervals
+          {:else if cutMode === "rounds"}
             {roundPreset === "fightOnly"
               ? `Rounds only: ${roundLength}s cut / ${breakLength}s skipped`
               : `Round + pause: ${roundLength + breakLength}s per clip`}
@@ -567,7 +931,6 @@
       </p>
     {/if}
 
-    <p bind:this={messageElement}></p>
     <p><em>Open Developer Tools (Ctrl+Shift+I) to view detailed logs</em></p>
   {:else}
     <button onclick={load} disabled={loading}>
@@ -581,6 +944,10 @@
 
   {#if transcoding}
     <p>Processing video, please wait...</p>
+  {/if}
+
+  {#if detecting}
+    <p>{detectStatus || "Analyzing audio, please wait..."}</p>
   {/if}
 </main>
 
@@ -676,6 +1043,49 @@
   .transcode-button {
     width: 100%;
     margin: 10px 0 0 0;
+  }
+
+  .detect-button {
+    width: 100%;
+    margin: 10px 0 4px 0;
+  }
+
+  .detect-results {
+    margin: 15px 0;
+    padding: 10px 15px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--info-bg);
+    color: var(--info-text);
+  }
+
+  .round-list {
+    list-style: none;
+    padding: 0;
+    margin: 10px 0 0 0;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+
+  .round-list li {
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .round-list .radio-label span {
+    font-size: 13px;
+  }
+
+  .detect-warning {
+    margin: 8px 0 0 0;
+    font-size: 13px;
+    color: var(--error-border);
+  }
+
+  .detect-hint {
+    margin: 8px 0 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
   }
 
   .controls-section h3 {
