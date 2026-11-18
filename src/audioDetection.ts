@@ -113,14 +113,17 @@ export function detectBoundaries(pcm: Int16Array, cfg: DetectConfig): number[] {
 }
 
 /**
- * Turn raw bell onsets into clips. Boxing usually has a bell at round end and
- * another at round start, so a short interval (~break length) between two bells
- * marks a break; the longer intervals are the fights. When no such pattern is
- * found, every interval is treated as a round.
+ * Turn raw bell onsets into clips. In a real session a round lasts about
+ * `roundSec` and the pause between rounds about `breakSec`, so every interval
+ * is classified by whichever expected duration it is closer to.
+ *
+ * Callers are expected to run `filterPlausibleOnsets()` first, which removes
+ * onsets whose intervals match neither duration (bag chains, clanks, ...).
  */
 export function onsetsToRounds(
   onsets: number[],
-  expectedBreakSec: number,
+  roundSec: number,
+  breakSec: number,
 ): { intervals: Array<Segment & { isBreak: boolean }>; breakPatternFound: boolean } {
   const intervals: Array<Segment & { isBreak: boolean }> = []
   for (let i = 0; i < onsets.length - 1; i++) {
@@ -128,25 +131,110 @@ export function onsetsToRounds(
   }
   if (intervals.length === 0) return { intervals, breakPatternFound: false }
 
-  const durations = intervals.map((s) => s.end - s.start).sort((a, b) => a - b)
-  const median = durations[durations.length >> 1]
-  const low = expectedBreakSec * 0.5
-  const high = expectedBreakSec * 1.75
-
-  let breakCount = 0
+  let breakPatternFound = false
   for (const interval of intervals) {
     const d = interval.end - interval.start
-    if (d >= low && d <= high && d <= median * 1.1) {
-      interval.isBreak = true
-      breakCount++
+    const roundErr = Math.abs(d - roundSec) / roundSec
+    const breakErr = breakSec > 0 ? Math.abs(d - breakSec) / breakSec : Infinity
+    interval.isBreak = breakErr < roundErr
+    if (interval.isBreak) breakPatternFound = true
+  }
+  return { intervals, breakPatternFound }
+}
+
+// How far a detected interval may deviate from the expected round/break length
+// before its onsets are treated as false positives. A gong pair at 1:20 is not
+// a 1:00 break; it is noise that happens to fall in between.
+const ROUND_TOLERANCE = 0.2 // ±20 % of the expected round length
+const BREAK_TOLERANCE = 0.3 // ±30 % of the expected break length
+
+function intervalError(d: number, roundSec: number, breakSec: number): number {
+  const roundErr = Math.abs(d - roundSec) / roundSec
+  const breakErr = breakSec > 0 ? Math.abs(d - breakSec) / breakSec : Infinity
+  return Math.min(roundErr, breakErr)
+}
+
+function isPlausibleInterval(d: number, roundSec: number, breakSec: number): boolean {
+  if (Math.abs(d - roundSec) <= roundSec * ROUND_TOLERANCE) return true
+  return Math.abs(d - breakSec) <= breakSec * BREAK_TOLERANCE
+}
+
+/**
+ * Drop onsets that cannot be part of a round/break rhythm. A boxing session is
+ * a sequence of ~`roundSec` rounds separated by ~`breakSec` pauses, so an
+ * interval that matches neither is evidence of a false positive (a bag chain,
+ * a clash, a dropped weight). Iteratively removes the least trustworthy onset
+ * bounding such an interval: lowest detector score first, then the removal that
+ * leaves the most plausible intervals.
+ *
+ * With fewer than two onsets left there is no complete round to cut, which is
+ * the honest result for audio that contains only one real gong.
+ */
+export function filterPlausibleOnsets(
+  onsets: number[],
+  scores: number[] | undefined,
+  roundSec: number,
+  breakSec: number,
+): { onsets: number[]; scores: number[]; rejected: number } {
+  const items = onsets.map((time, i) => ({ time, score: scores?.[i] ?? 1 }))
+  const rejected = onsets.length
+
+  const badIntervalCount = (): number => {
+    let count = 0
+    for (let i = 0; i < items.length - 1; i++) {
+      if (!isPlausibleInterval(items[i + 1].time - items[i].time, roundSec, breakSec)) count++
     }
+    return count
   }
 
-  // If *every* interval looks like a break the heuristic misfired (there would
-  // be no rounds left to cut). Fall back to treating them all as rounds.
-  if (breakCount === 0 || breakCount === intervals.length) {
-    for (const interval of intervals) interval.isBreak = false
-    return { intervals, breakPatternFound: false }
+  const totalErrorWithout = (index: number): number => {
+    let total = 0
+    let prev: number | null = null
+    for (let i = 0; i < items.length; i++) {
+      if (i === index) continue
+      const time = items[i].time
+      if (prev !== null) total += intervalError(time - prev, roundSec, breakSec)
+      prev = time
+    }
+    return total
   }
-  return { intervals, breakPatternFound: true }
+
+  while (items.length >= 2 && badIntervalCount() > 0) {
+    const candidates = new Set<number>()
+    for (let i = 0; i < items.length - 1; i++) {
+      if (isPlausibleInterval(items[i + 1].time - items[i].time, roundSec, breakSec)) continue
+      candidates.add(i)
+      candidates.add(i + 1)
+    }
+
+    // Lowest score loses; on a score tie keep the removal that fits the
+    // expected durations best, and prefer dropping the later onset.
+    const rank = (index: number) => {
+      const error = totalErrorWithout(index)
+      return { score: items[index].score, error, time: items[index].time }
+    }
+    let victim = -1
+    let best: ReturnType<typeof rank> | null = null
+    for (const index of candidates) {
+      const candidate = rank(index)
+      const better =
+        best === null ||
+        candidate.score < best.score - 1e-9 ||
+        (Math.abs(candidate.score - best.score) <= 1e-9 &&
+          (candidate.error < best.error - 1e-9 ||
+            (Math.abs(candidate.error - best.error) <= 1e-9 &&
+              candidate.time > best.time)))
+      if (better) {
+        victim = index
+        best = candidate
+      }
+    }
+    items.splice(victim, 1)
+  }
+
+  return {
+    onsets: items.map((item) => item.time),
+    scores: items.map((item) => item.score),
+    rejected: rejected - items.length,
+  }
 }

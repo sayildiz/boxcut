@@ -5,11 +5,18 @@
   import {
     DEFAULT_DETECT_CONFIG,
     detectBoundaries,
+    filterPlausibleOnsets,
     onsetsToRounds,
     toInt16Array,
     type Segment,
   } from "./audioDetection";
   import { detectGong, YAMNET_SAMPLE_RATE } from "./yamnet";
+  import {
+    extractFingerprint,
+    findFingerprintMatches,
+    mergeOnsetHits,
+    type OnsetHit,
+  } from "./toneFingerprint";
 
   let loaded = $state<boolean>(false);
   let loading = $state<boolean>(false);
@@ -46,12 +53,17 @@
   let detectBackend = $state<DetectBackend>("model");
   let onsets = $state<number[]>([]);
   let detectedClips = $state<DetectedClip[]>([]);
+  let detectedIntervals = $state<Array<Segment & { isBreak: boolean }>>([]);
   let breakPatternFound = $state<boolean>(false);
   let includeBreaks = $state<boolean>(false);
   let detectSensitivity = $state<number>(DEFAULT_DETECT_CONFIG.sensitivityDb);
   let detectThreshold = $state<number>(0.3);
   let detectMinGap = $state<number>(DEFAULT_DETECT_CONFIG.minGapSec);
+  let detectRoundLength = $state<number>(180);
   let detectBreakLength = $state<number>(60);
+  let detectGongTail = $state<boolean>(true);
+  let detectGongTailSec = $state<number>(2);
+  let rejectedOnsets = $state<number>(0);
 
   onMount(() => {
     // Initialize FFmpeg instance
@@ -358,6 +370,23 @@
     }
   };
 
+  // Materialise reviewable clips from the detected intervals. Gong strikes are
+  // reported slightly after the physical hit, and a hard cut at the boundary
+  // chops the ring off, so an optional tail keeps the closing gong audible.
+  const rebuildDetectedClips = (): void => {
+    const tail = detectGongTail ? Math.max(0, detectGongTailSec) : 0;
+    const enabledBefore = detectedClips.map((clip) => clip.enabled);
+    detectedClips = detectedIntervals.map((interval, index) => ({
+      start: interval.start,
+      end:
+        sourceDuration > 0
+          ? Math.min(interval.end + tail, sourceDuration)
+          : interval.end + tail,
+      isBreak: interval.isBreak,
+      enabled: enabledBefore[index] ?? !interval.isBreak,
+    }));
+  };
+
   // Decode the video's audio to mono PCM, scan for bell onsets, and turn them
   // into candidate fight/break clips for the user to review before cutting.
   const runDetection = async (): Promise<void> => {
@@ -370,8 +399,10 @@
       return;
     }
     if (
+      detectRoundLength <= 0 ||
       detectBreakLength <= 0 ||
       detectMinGap <= 0 ||
+      detectGongTailSec < 0 ||
       (detectBackend === "energy" && detectSensitivity <= 0) ||
       (detectBackend === "model" && (detectThreshold <= 0 || detectThreshold >= 1))
     ) {
@@ -384,7 +415,9 @@
     detectStatus =
       detectBackend === "model" ? "Loading model…" : "Analyzing audio…";
     onsets = [];
+    rejectedOnsets = 0;
     detectedClips = [];
+    detectedIntervals = [];
     breakPatternFound = false;
     try {
       console.log("Extracting audio for detection...");
@@ -414,6 +447,8 @@
       console.log(`Analyzing ${pcm.length} audio samples @ ${sampleRate} Hz...`);
 
       const start = timeToSeconds(startTime);
+      let candidateOnsets: number[] = [];
+      let candidateScores: number[] | undefined;
       if (detectBackend === "model") {
         detectStatus = "Running gong classifier…";
         const result = await detectGong(pcm, {
@@ -424,7 +459,41 @@
           },
         });
         console.log("Top classes per frame:", result.topClassNames);
-        onsets = result.onsets.filter((t) => t >= start);
+        let hits: OnsetHit[] = result.onsets.map((time, i) => ({
+          time,
+          score: result.onsetScores[i],
+        }));
+        // The model is confident about some gongs and blind to identical ones
+        // later in the recording. Learn the gong's tonal fingerprint from the
+        // strongest hit and scan for repeats, then merge both lists.
+        const anchor = hits.reduce<OnsetHit | null>(
+          (best, hit) => (!best || hit.score > best.score ? hit : best),
+          null,
+        );
+        if (anchor) {
+          detectStatus = "Matching the gong's tone…";
+          const fingerprint = extractFingerprint(
+            pcm,
+            YAMNET_SAMPLE_RATE,
+            anchor.time,
+          );
+          if (fingerprint) {
+            const matches = findFingerprintMatches(
+              pcm,
+              YAMNET_SAMPLE_RATE,
+              fingerprint,
+            );
+            console.log(
+              `Gong fingerprint: ${fingerprint.freqs
+                .map((f) => `${f.toFixed(0)} Hz`)
+                .join(" + ")} (${fingerprint.strengthDb.toFixed(0)} dB) → ${matches.length} match(es)`,
+            );
+            hits = mergeOnsetHits([hits, matches], detectMinGap);
+          }
+        }
+        const kept = hits.filter((hit) => hit.time >= start);
+        candidateOnsets = kept.map((hit) => hit.time);
+        candidateScores = kept.map((hit) => hit.score);
       } else {
         detectStatus = "Scanning for loudness peaks…";
         const config = {
@@ -432,22 +501,40 @@
           sensitivityDb: detectSensitivity,
           minGapSec: detectMinGap,
         };
-        onsets = detectBoundaries(pcm, config).filter((t) => t >= start);
+        candidateOnsets = detectBoundaries(pcm, config).filter((t) => t >= start);
       }
 
-      const mapped = onsetsToRounds(onsets, detectBreakLength);
+      // Only keep gongs that are ~roundLength apart (a round) or
+      // ~detectBreakLength apart (a break); anything else is a false positive.
+      const plausible = filterPlausibleOnsets(
+        candidateOnsets,
+        candidateScores,
+        detectRoundLength,
+        detectBreakLength,
+      );
+      onsets = plausible.onsets;
+      rejectedOnsets = plausible.rejected;
+
+      const mapped = onsetsToRounds(
+        onsets,
+        detectRoundLength,
+        detectBreakLength,
+      );
       breakPatternFound = mapped.breakPatternFound;
-      detectedClips = mapped.intervals.map((interval) => ({
-        ...interval,
-        enabled: !interval.isBreak,
-      }));
-      console.log("Detected onsets:", onsets);
+      detectedIntervals = mapped.intervals;
+      rebuildDetectedClips();
+      console.log(
+        `Detected onsets: ${onsets.length} (${rejectedOnsets} rejected as out-of-rhythm)`,
+        onsets,
+      );
       console.log("Detected clips:", detectedClips);
       if (onsets.length === 0) {
         error =
-          detectBackend === "model"
-            ? "No gong/bell detected. Try lowering the threshold, or switch to the loudness backend."
-            : "No bell onsets detected. Try lowering the sensitivity, or check that the audio has a clear bell.";
+          candidateOnsets.length > 0
+            ? `Found ${candidateOnsets.length} bell-like sound(s), but none fit a ${detectRoundLength}s round or ${detectBreakLength}s break rhythm. Lower the threshold or adjust the expected lengths.`
+            : detectBackend === "model"
+              ? "No gong/bell detected. Try lowering the threshold, or switch to the loudness backend."
+              : "No bell onsets detected. Try lowering the sensitivity, or check that the audio has a clear bell.";
       }
     } catch (err) {
       error = `Audio detection failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -785,6 +872,22 @@
         </div>
 
         <div class="input-group">
+          <label for="detectRoundLength">Expected round length (seconds):</label>
+          <input
+            id="detectRoundLength"
+            bind:value={detectRoundLength}
+            type="number"
+            min="10"
+            step="1"
+            class="number-input"
+          />
+          <small
+            >Gongs must land about this far apart (or the break length below) to
+            count; other intervals are treated as false positives</small
+          >
+        </div>
+
+        <div class="input-group">
           <label for="detectBreakLength">Expected break length (seconds):</label>
           <input
             id="detectBreakLength"
@@ -795,6 +898,37 @@
             class="number-input"
           />
           <small>Used to tell the round-end/start bell pair apart from round boundaries</small>
+        </div>
+
+        <div class="input-group">
+          <label class="radio-label">
+            <input
+              type="checkbox"
+              bind:checked={detectGongTail}
+              onchange={rebuildDetectedClips}
+            />
+            Keep the closing gong audible
+          </label>
+          <div class="tail-row">
+            <label for="detectGongTailSec">Tail after each gong:</label>
+            <input
+              id="detectGongTailSec"
+              bind:value={detectGongTailSec}
+              onchange={rebuildDetectedClips}
+              type="number"
+              min="0"
+              max="15"
+              step="0.5"
+              class="number-input"
+              disabled={!detectGongTail}
+            />
+            <span>s</span>
+          </div>
+          <small
+            >Clips end at the detected gong, which is reported slightly late; this
+            adds a tail so the ring is not cut off (+2 s = 3:02 rounds). Turn off to
+            cut exactly on the boundaries.</small
+          >
         </div>
 
         <button
@@ -811,20 +945,23 @@
             <p>
               <strong>{onsets.length}</strong> onset{onsets.length === 1
                 ? ""
-                : "s"} detected,
+                : "s"} kept{rejectedOnsets > 0
+                ? ` (${rejectedOnsets} rejected as false positive${rejectedOnsets === 1 ? "" : "s"})`
+                : ""},
               <strong>{detectedClips.length}</strong> candidate clip{detectedClips.length ===
               1
                 ? ""
                 : "s"}.
               {#if !breakPatternFound && detectedClips.length > 0}
-                <em>No clear break pattern found — review the clips below.</em>
+                <em>No break found — every kept interval looks like a round.</em>
               {/if}
             </p>
             {#if detectedClips.length === 0}
               <p class="detect-warning">
-                Only one onset was found, so there is nothing to cut between. Lower
-                the confidence threshold (or sensitivity), or set a start time
-                closer to the rounds.
+                No complete round found: a round needs two gongs about
+                {detectRoundLength}s apart (or a {detectBreakLength}s break).
+                Lower the confidence threshold (or sensitivity) to find the
+                missing gong, or adjust the expected lengths.
               </p>
             {:else}
               <label class="radio-label">
@@ -1120,10 +1257,26 @@
     cursor: pointer;
   }
 
-  .radio-label input[type="radio"] {
+  .radio-label input[type="radio"],
+  .radio-label input[type="checkbox"] {
     width: auto;
     margin: 0;
     accent-color: var(--accent);
+  }
+
+  .tail-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .tail-row label {
+    margin: 0;
+    font-weight: normal;
+  }
+
+  .tail-row .number-input {
+    width: 90px;
   }
 
   .time-input,
